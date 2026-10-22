@@ -27,6 +27,12 @@ interface CursorPosition {
   avatarUrl?: string;
   lineNumber: number;
   column: number;
+  selection?: {
+    startLineNumber: number;
+    startColumn: number;
+    endLineNumber: number;
+    endColumn: number;
+  };
   color: string;
   fileId: string;
   timestamp: number;
@@ -448,6 +454,12 @@ export function setupCRDTServer(io: Server): void {
       fileId: string;
       lineNumber: number;
       column: number;
+      selection?: {
+        startLineNumber: number;
+        startColumn: number;
+        endLineNumber: number;
+        endColumn: number;
+      };
     }) => {
       if (!checkCrdtRateLimit(socket.id)) {
         handleFloodViolation(socket, 'cursor-update', data?.projectId);
@@ -455,7 +467,7 @@ export function setupCRDTServer(io: Server): void {
       }
 
       if (!data?.fileId || !data?.projectId) return;
-      const { projectId, fileId, lineNumber, column } = data;
+      const { projectId, fileId, lineNumber, column, selection } = data;
 
       const role = getCallerRole(projectId, userId);
       if (!role) return;
@@ -465,6 +477,7 @@ export function setupCRDTServer(io: Server): void {
         username,
         lineNumber: typeof lineNumber === 'number' ? lineNumber : 1,
         column: typeof column === 'number' ? column : 1,
+        selection,
         color: getUserColor(userId),
         fileId,
         timestamp: Date.now()
@@ -492,7 +505,7 @@ export function setupCRDTServer(io: Server): void {
       const { projectId, fileId, lineNumber } = data;
 
       const role = getCallerRole(projectId, userId);
-      if (!role) return;
+      if (!role || role === 'VIEWER') return;
 
       if (!fileBreakpoints.has(fileId)) fileBreakpoints.set(fileId, new Map());
       const bpMap = fileBreakpoints.get(fileId)!;
@@ -640,21 +653,37 @@ export function setupCRDTServer(io: Server): void {
       const role = getCallerRole(projectId, userId);
       if (!role || role === 'VIEWER') return;
 
-      // Evict stale Y.Docs for all files in the project so they get re-hydrated
-      // on next join-file. We do a targeted eviction by checking activeDocs keys.
+      // Update server Y.Docs for all files in the project from the restored database state
       for (const [fileId, _doc] of activeDocs.entries()) {
         const file = getFileById(fileId);
         if (file?.project_id === projectId) {
-          activeDocs.delete(fileId);
-          // Clear persisted timers for evicted docs
           if (persistTimers.has(fileId)) {
             clearTimeout(persistTimers.get(fileId)!);
             persistTimers.delete(fileId);
           }
+
+          // Re-create Y.Doc with restored file content
+          const newDoc = new Y.Doc();
+          const newText = newDoc.getText('monaco');
+          newText.insert(0, file.content || '');
+          activeDocs.set(fileId, newDoc);
+
+          // Persist the binary state vector to SQLite
+          const stateVector = Y.encodeStateAsUpdate(newDoc);
+          updateFileContent(fileId, file.content || '', Buffer.from(stateVector));
+
+          // Broadcast fresh state to all sockets in the file room so open editors reflect it
+          const stateBase64 = Buffer.from(stateVector).toString('base64');
+          io.to(`file:${fileId}`).emit('yjs-update', {
+            fileId,
+            updateBase64: stateBase64,
+            userId: 'system',
+            username: 'System'
+          });
         }
       }
 
-      // Notify all project sockets that they need to re-join their file
+      // Notify all project sockets that snapshot has been restored
       io.to(`project:${projectId}`).emit('snapshot-restored', {
         projectId,
         snapshotId: data.snapshotId,

@@ -513,7 +513,8 @@ export const CollabDrawer: React.FC<CollabDrawerProps> = ({
     setAiError(null);
     setAiResult(null);
     try {
-      const result = await requestAIAssist(action.prompt, liveCode, language);
+      const codeToSend = (liveCode || currentFile?.content || '').trim();
+      const result = await requestAIAssist(action.prompt, codeToSend, language);
       setAiResult(result);
     } catch (err: any) {
       setAiError(err.message ?? 'AI Co-Pilot unavailable.');
@@ -521,6 +522,8 @@ export const CollabDrawer: React.FC<CollabDrawerProps> = ({
       setAiLoading(false);
     }
   };
+
+  const activeAiCode = (liveCode || currentFile?.content || '').trim();
 
   if (!isOpen) return null;
 
@@ -1078,7 +1081,7 @@ export const CollabDrawer: React.FC<CollabDrawerProps> = ({
                     <button
                       key={action.id}
                       onClick={() => handleAiAction(action)}
-                      disabled={aiLoading || !liveCode.trim()}
+                      disabled={aiLoading || !activeAiCode}
                       className={cn(
                         'w-full flex items-center space-x-3 rounded border px-3 py-2.5 text-left text-xs font-medium transition-all disabled:opacity-50',
                         action.color === 'indigo' && 'border-indigo-800/60 bg-indigo-950/30 text-indigo-200 hover:bg-indigo-900/40',
@@ -1097,7 +1100,7 @@ export const CollabDrawer: React.FC<CollabDrawerProps> = ({
                   );
                 })}
               </div>
-              {!liveCode.trim() && (
+              {!activeAiCode && (
                 <p className="text-[11px] text-slate-600 text-center pt-1">
                   Open a file with code to enable AI Co-Pilot.
                 </p>

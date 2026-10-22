@@ -9,14 +9,12 @@ import {
   Copy,
   Check,
   ChevronLeft,
-  ChevronDown,
   Shield,
   ShieldAlert,
   ShieldCheck,
   AlertTriangle,
   Zap,
   Activity,
-  UserCheck,
   Users,
   Flame,
   X,
@@ -24,7 +22,9 @@ import {
   BookmarkPlus,
   Loader2,
   Radio,
-  FileCode
+  FileCode,
+  Lock,
+  LogOut
 } from 'lucide-react';
 
 import {
@@ -33,7 +33,6 @@ import {
   CollaboratorRole,
   CursorPosition,
   ExecutionResult,
-  Persona,
   Project,
   ProjectFile,
   ProjectMember,
@@ -42,12 +41,9 @@ import {
 } from './types';
 
 import {
-  DEFAULT_PERSONAS,
-  getActivePersona,
+  authAPI,
   getStoredToken,
   getStoredUser,
-  initSession,
-  switchPersona,
   fetchProjectFiles,
   getProjectDetails,
   createSnapshot,
@@ -55,6 +51,7 @@ import {
   cn
 } from './services/api';
 
+import { AuthScreen } from './components/AuthScreen';
 import { Dashboard } from './components/Dashboard';
 import { SidebarFileTree } from './components/SidebarFileTree';
 import { CollaborativeEditor } from './components/CollaborativeEditor';
@@ -76,11 +73,10 @@ interface SecurityAlertToast {
 }
 
 export const App: React.FC = () => {
-  // ─── Persona & User State ──────────────────────────────────────────────────
-  const [currentPersona, setCurrentPersona] = useState<Persona>(() => getActivePersona());
+  // ─── Authentication & Session State ─────────────────────────────────────────
   const [currentUser, setCurrentUser] = useState<User | null>(() => getStoredUser());
   const [token, setToken] = useState<string | null>(() => getStoredToken());
-  const [personaDropdownOpen, setPersonaDropdownOpen] = useState(false);
+  const [authChecking, setAuthChecking] = useState<boolean>(true);
 
   // ─── Project & File State ──────────────────────────────────────────────────
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
@@ -111,45 +107,85 @@ export const App: React.FC = () => {
   const [runningCode, setRunningCode] = useState(false);
 
   // ─── Live Security Alert Toast ─────────────────────────────────────────────
+  const securityToastRef = useRef<SecurityAlertToast | null>(null);
   const [securityToast, setSecurityToast] = useState<SecurityAlertToast | null>(null);
   const toastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshFilesRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
-  // ─── Compute Effective User Role ───────────────────────────────────────────
-  const currentUserRole: CollaboratorRole = (() => {
-    if (!selectedProject || !currentUser) return currentPersona.role;
-    if (selectedProject.owner_id === currentUser.id) return 'OWNER';
-    const member = projectMembers.find(m => m.user_id === currentUser.id);
-    if (member) return member.role;
-    return currentPersona.role || 'EDITOR';
-  })();
-
-  // ─── Initialize Session on Mount ───────────────────────────────────────────
+  // ─── Verify Session on Mount ───────────────────────────────────────────────
   useEffect(() => {
-    const ensureSession = async () => {
+    let isMounted = true;
+
+    const verifySession = async () => {
+      const storedToken = getStoredToken();
+      const storedUser = getStoredUser();
+
+      if (!storedToken || !storedUser) {
+        if (isMounted) {
+          setToken(null);
+          setCurrentUser(null);
+          setAuthChecking(false);
+        }
+        return;
+      }
+
       try {
-        const storedToken = getStoredToken();
-        const storedUser = getStoredUser();
-        if (!storedToken || !storedUser) {
-          const { token: newToken, user: newUser } = await initSession(
-            currentPersona.username,
-            currentPersona.avatarUrl
-          );
-          setToken(newToken);
-          setCurrentUser(newUser);
-        } else {
+        const { user } = await authAPI.getMe();
+        if (isMounted) {
+          setCurrentUser(user);
           setToken(storedToken);
-          setCurrentUser(storedUser);
         }
       } catch (err) {
-        console.error('[App] Failed to initialize session:', err);
+        console.warn('[App] Session verification failed, gating app:', err);
+        authAPI.logout();
+        if (isMounted) {
+          setToken(null);
+          setCurrentUser(null);
+        }
+      } finally {
+        if (isMounted) {
+          setAuthChecking(false);
+        }
       }
     };
-    ensureSession();
-  }, [currentPersona]);
+
+    verifySession();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // ─── Handle Auth Success ───────────────────────────────────────────────────
+  const handleAuthSuccess = (user: User, newToken: string) => {
+    setCurrentUser(user);
+    setToken(newToken);
+  };
+
+  // ─── Handle Logout ─────────────────────────────────────────────────────────
+  const handleLogout = () => {
+    authAPI.logout();
+    setToken(null);
+    setCurrentUser(null);
+    setSelectedProject(null);
+    setCurrentFile(null);
+    setFiles([]);
+    if (socket) {
+      socket.disconnect();
+    }
+  };
+
+  // ─── Compute Effective User Role for Active Project ────────────────────────
+  const currentUserRole: CollaboratorRole = (() => {
+    if (!selectedProject || !currentUser) return 'VIEWER';
+    if (selectedProject.owner_id === currentUser.id) return 'OWNER';
+    const member = projectMembers.find((m) => m.user_id === currentUser.id);
+    if (member) return member.role;
+    return selectedProject.role || 'EDITOR';
+  })();
 
   // ─── Socket.IO Connection Setup (JWT Authenticated) ────────────────────────
   useEffect(() => {
-    if (!token) return;
+    if (!token || !currentUser) return;
 
     const socketUrl = 'http://localhost:4000';
     const newSocket = io(socketUrl, {
@@ -236,12 +272,17 @@ export const App: React.FC = () => {
       setProjectMembers(members);
     });
 
+    // Handle snapshot restored broadcast across all project collaborators
+    newSocket.on('snapshot-restored', () => {
+      refreshFilesRef.current();
+    });
+
     setSocket(newSocket);
 
     return () => {
       newSocket.disconnect();
     };
-  }, [token]);
+  }, [token, currentUser?.id]);
 
   // ─── Refresh Project Files ─────────────────────────────────────────────────
   const refreshFiles = useCallback(async () => {
@@ -264,6 +305,7 @@ export const App: React.FC = () => {
       console.error('[App] Failed to refresh files:', err);
     }
   }, [selectedProject]);
+  refreshFilesRef.current = refreshFiles;
 
   // ─── Refresh Project Details & Members ─────────────────────────────────────
   const refreshProjectDetails = useCallback(async (projId: string) => {
@@ -299,23 +341,6 @@ export const App: React.FC = () => {
     }
   }, [currentFile]);
 
-  // ─── Handle Persona Switch ─────────────────────────────────────────────────
-  const handlePersonaChange = async (newPersona: Persona) => {
-    try {
-      const { token: newToken, user: newUser } = await switchPersona(newPersona);
-      setCurrentPersona(newPersona);
-      setToken(newToken);
-      setCurrentUser(newUser);
-      setPersonaDropdownOpen(false);
-
-      if (selectedProject) {
-        await refreshProjectDetails(selectedProject.id);
-      }
-    } catch (err) {
-      console.error('[App] Failed to switch persona:', err);
-    }
-  };
-
   // ─── Copy Invite Code ──────────────────────────────────────────────────────
   const handleCopyInviteCode = () => {
     if (!selectedProject?.invite_code) return;
@@ -348,7 +373,7 @@ export const App: React.FC = () => {
 
   // ─── Run in Sandbox CTA ────────────────────────────────────────────────────
   const handleRunInSandbox = async () => {
-    if (!selectedProject || !currentFile) return;
+    if (!selectedProject || !currentFile || currentUserRole === 'VIEWER') return;
 
     setRunningCode(true);
     try {
@@ -383,6 +408,23 @@ export const App: React.FC = () => {
         return 'border-[#A855F7]/50 bg-[#A855F7]/10 text-[#A855F7]';
     }
   };
+
+  // ─── Loading Session Guard ─────────────────────────────────────────────────
+  if (authChecking) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-[#090D16] text-cyan-400 font-sans select-none">
+        <div className="flex flex-col items-center space-y-3">
+          <div className="h-9 w-9 animate-spin rounded-full border-2 border-cyan-400 border-t-transparent" />
+          <span className="font-mono text-xs text-slate-400">Verifying Zero-Trust Session...</span>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Lock Down the App: Render AuthScreen if unauthenticated ────────────────
+  if (!currentUser || !token) {
+    return <AuthScreen onAuthSuccess={handleAuthSuccess} />;
+  }
 
   // ─── If No Project Selected: Render Dashboard ──────────────────────────────
   if (!selectedProject) {
@@ -434,8 +476,8 @@ export const App: React.FC = () => {
 
         <Dashboard
           onSelectProject={handleSelectProject}
-          currentPersona={currentPersona}
-          onPersonaChange={handlePersonaChange}
+          currentUser={currentUser}
+          onLogout={handleLogout}
         />
       </div>
     );
@@ -549,96 +591,55 @@ export const App: React.FC = () => {
           </button>
         </div>
 
-        {/* Center: Live Collaborator Avatar Stack with Glowing Status Rings */}
+        {/* Center: Live Project Collaborators Avatar Stack */}
         <div className="hidden lg:flex items-center space-x-3">
           <div className="flex items-center space-x-1 text-xs text-slate-400 font-medium mr-1">
             <Users className="h-3.5 w-3.5 text-slate-500" />
-            <span>Collaborators</span>
+            <span>Workspace Members</span>
           </div>
 
           <div className="flex items-center -space-x-2 overflow-visible">
-            {DEFAULT_PERSONAS.map((p) => {
-              const isCurrent = p.username === currentPersona.username;
+            {projectMembers.map((m) => {
+              const isSelf = m.user_id === currentUser.id;
               return (
                 <div
-                  key={p.id}
-                  title={`${p.username} (${p.role}) — ${isCurrent ? 'Active Self' : 'Online'}`}
+                  key={m.id || m.user_id}
+                  title={`${m.username || 'Collaborator'} (${m.role})${isSelf ? ' — (You)' : ''}`}
                   className="relative group cursor-pointer"
-                  onClick={() => handlePersonaChange(p)}
                 >
-                  <img
-                    src={p.avatarUrl}
-                    alt={p.username}
+                  <div
                     className={cn(
-                      'h-8 w-8 rounded-full border-2 border-[#0B101E] bg-[#15233E] object-cover transition-transform group-hover:scale-110 group-hover:z-10',
-                      getRoleRingClass(p.role),
-                      isCurrent && 'scale-105 z-10'
+                      'h-8 w-8 rounded-full border-2 border-[#0B101E] flex items-center justify-center font-bold text-xs text-slate-950 transition-transform group-hover:scale-110 group-hover:z-10',
+                      getRoleRingClass(m.role),
+                      isSelf && 'scale-105 z-10'
                     )}
-                  />
-                  {/* Glowing online pulse dot */}
+                    style={{
+                      backgroundColor: isSelf
+                        ? currentUser.avatar_color || '#00F0FF'
+                        : m.role === 'OWNER'
+                        ? '#FFB800'
+                        : m.role === 'EDITOR'
+                        ? '#00F0FF'
+                        : '#A855F7'
+                    }}
+                  >
+                    {(m.username || 'U').charAt(0).toUpperCase()}
+                  </div>
                   <span
                     className={cn(
                       'absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-[#0B101E]',
-                      p.role === 'OWNER' && 'bg-[#FFB800] shadow-[0_0_8px_#FFB800]',
-                      p.role === 'EDITOR' && 'bg-[#00F0FF] shadow-[0_0_8px_#00F0FF]',
-                      p.role === 'VIEWER' && 'bg-[#A855F7] shadow-[0_0_8px_#A855F7]'
+                      m.role === 'OWNER' && 'bg-[#FFB800] shadow-[0_0_8px_#FFB800]',
+                      m.role === 'EDITOR' && 'bg-[#00F0FF] shadow-[0_0_8px_#00F0FF]',
+                      m.role === 'VIEWER' && 'bg-[#A855F7] shadow-[0_0_8px_#A855F7]'
                     )}
                   />
                 </div>
               );
             })}
           </div>
-
-          {/* Quick Persona Switcher in Header */}
-          <div className="relative">
-            <button
-              onClick={() => setPersonaDropdownOpen(!personaDropdownOpen)}
-              className={cn(
-                'flex items-center space-x-1.5 rounded-lg border px-2.5 py-1 text-xs font-semibold transition-all',
-                getRoleBadgeClass(currentUserRole)
-              )}
-            >
-              <span>{currentPersona.username.split(' ')[0]}</span>
-              <span className="text-[10px] font-mono opacity-80">({currentUserRole})</span>
-              <ChevronDown className="h-3 w-3 opacity-60" />
-            </button>
-
-            {personaDropdownOpen && (
-              <div className="absolute right-0 top-full mt-2 w-56 rounded-xl border border-[#253554] bg-[#0F172A] p-2 shadow-2xl z-50 animate-in fade-in zoom-in-95">
-                <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                  Switch Persona (RBAC Test)
-                </div>
-                {DEFAULT_PERSONAS.map((p) => (
-                  <button
-                    key={p.id}
-                    onClick={() => handlePersonaChange(p)}
-                    className={cn(
-                      'w-full flex items-center justify-between rounded-lg px-2.5 py-2 text-xs font-medium transition-colors text-left',
-                      p.username === currentPersona.username
-                        ? 'bg-[#1E293B] text-cyan-300'
-                        : 'text-slate-300 hover:bg-[#1E293B]/60'
-                    )}
-                  >
-                    <div className="flex items-center space-x-2">
-                      <img src={p.avatarUrl} alt="" className="h-5 w-5 rounded-full" />
-                      <span>{p.username}</span>
-                    </div>
-                    <span
-                      className={cn(
-                        'rounded px-1.5 py-0.5 text-[9px] font-bold uppercase border',
-                        getRoleBadgeClass(p.role)
-                      )}
-                    >
-                      {p.role}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
         </div>
 
-        {/* Right: Actions CTA Buttons */}
+        {/* Right: Actions CTA Buttons & User Profile / Logout */}
         <div className="flex items-center space-x-2">
           {/* Save Snapshot Button */}
           <button
@@ -663,7 +664,7 @@ export const App: React.FC = () => {
           {/* Run in Sandbox CTA */}
           <button
             onClick={handleRunInSandbox}
-            disabled={runningCode || !currentFile}
+            disabled={runningCode || !currentFile || currentUserRole === 'VIEWER'}
             title={
               currentUserRole === 'VIEWER'
                 ? 'VIEWER accounts cannot execute code (RBAC enforced)'
@@ -698,6 +699,31 @@ export const App: React.FC = () => {
             <Layers className="h-3.5 w-3.5" />
             <span className="hidden md:inline">Collab Drawer</span>
           </button>
+
+          {/* User Profile Pill & Logout Button */}
+          <div className="flex items-center space-x-2 pl-2 border-l border-[#1E293B]">
+            <div className="hidden sm:flex items-center space-x-2 rounded-lg border border-[#253554] bg-[#0E1527] px-2.5 py-1">
+              <div
+                className="w-5 h-5 rounded-full flex items-center justify-center font-bold text-[10px] text-slate-950 shadow-sm"
+                style={{ backgroundColor: currentUser.avatar_color || '#00F0FF' }}
+              >
+                {currentUser.username.charAt(0).toUpperCase()}
+              </div>
+              <span className="text-xs font-semibold text-slate-200">{currentUser.username}</span>
+              <span className={cn('rounded px-1.5 py-0.2 text-[9px] font-bold uppercase border', getRoleBadgeClass(currentUserRole))}>
+                {currentUserRole}
+              </span>
+            </div>
+
+            <button
+              onClick={handleLogout}
+              title="Sign out of DevCollab session"
+              className="flex items-center space-x-1.5 rounded-lg border border-[#253554] bg-[#0E1527] px-2.5 py-1.5 text-xs font-medium text-slate-400 hover:border-rose-500/50 hover:bg-rose-950/40 hover:text-rose-300 transition-all shadow-sm"
+            >
+              <Lock className="h-3.5 w-3.5" />
+              <span className="hidden md:inline">Logout</span>
+            </button>
+          </div>
         </div>
       </header>
 
@@ -722,13 +748,13 @@ export const App: React.FC = () => {
         {/* Center: Editor + Execution Console */}
         <main className="flex flex-1 min-w-0 flex-col overflow-hidden bg-[#050810]">
           {/* Top: Collaborative Monaco CRDT Editor */}
-          <div className="flex-1 min-h-0 relative">
+          <div className="flex-1 min-h-0 relative overflow-hidden">
             {currentFile ? (
               <CollaborativeEditor
                 file={currentFile}
                 projectId={selectedProject.id}
-                userId={currentUser?.id || 'anonymous-user'}
-                username={currentUser?.username || currentPersona.username}
+                userId={currentUser.id}
+                username={currentUser.username}
                 userRole={currentUserRole}
                 socket={socket}
                 conflictBurstTrigger={burstCount}
@@ -736,6 +762,7 @@ export const App: React.FC = () => {
                   setCrdtOps((prev) => prev + ops);
                   setYjsBytes(bytes);
                 }}
+                onCodeChange={(code) => setLiveCode(code)}
               />
             ) : (
               <div className="flex h-full w-full flex-col items-center justify-center space-y-3 text-slate-500">
@@ -754,8 +781,8 @@ export const App: React.FC = () => {
             language={currentFile?.language || 'javascript'}
             userRole={currentUserRole}
             socket={socket}
-            userId={currentUser?.id || 'anonymous-user'}
-            username={currentUser?.username || currentPersona.username}
+            userId={currentUser.id}
+            username={currentUser.username}
             onExecutionComplete={() => {}}
             initialCollapsed={false}
           />
@@ -768,8 +795,8 @@ export const App: React.FC = () => {
           projectId={selectedProject.id}
           currentFile={currentFile}
           userRole={currentUserRole}
-          userId={currentUser?.id || 'anonymous-user'}
-          username={currentUser?.username || currentPersona.username}
+          userId={currentUser.id}
+          username={currentUser.username}
           socket={socket}
           breakpoints={breakpoints}
           liveCode={liveCode || currentFile?.content}
@@ -783,7 +810,7 @@ export const App: React.FC = () => {
       <TelemetryBar
         projectId={selectedProject.id}
         userRole={currentUserRole}
-        username={currentUser?.username || currentPersona.username}
+        username={currentUser.username}
         crdtOpsCount={crdtOps}
         yjsByteSize={yjsBytes}
         onSimulateBurst={() => setBurstCount((c) => c + 1)}
@@ -801,8 +828,9 @@ export const App: React.FC = () => {
         currentFile={currentFile}
         liveCode={liveCode || currentFile?.content || ''}
         userRole={currentUserRole}
-        username={currentUser?.username || currentPersona.username}
+        username={currentUser.username}
         socket={socket}
+        onSnapshotRestored={refreshFiles}
       />
 
       {/* ════════════════════════════════════════════════════════════════════════

@@ -21,6 +21,33 @@ function base64UrlDecode(str: string): string {
 }
 
 /**
+ * Zero-dependency password hashing helper using Node native crypto pbkdf2
+ */
+export function hashPassword(password: string): { salt: string; hash: string } {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+  return { salt, hash };
+}
+
+/**
+ * Constant-time password verification helper
+ */
+export function verifyPassword(password: string, salt: string, storedHash: string): boolean {
+  if (!password || !salt || !storedHash) return false;
+  try {
+    const computedHash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+    const computedBuffer = Buffer.from(computedHash, 'utf8');
+    const storedBuffer = Buffer.from(storedHash, 'utf8');
+    if (computedBuffer.length !== storedBuffer.length) {
+      return false;
+    }
+    return crypto.timingSafeEqual(computedBuffer, storedBuffer);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Sign an auth token using Node native crypto HMAC-SHA256
  */
 export function signToken(payload: Record<string, any>, expiresInSec: number = 86400 * 7): string {

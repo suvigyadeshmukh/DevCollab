@@ -5,6 +5,10 @@ export type CollaboratorRole = 'OWNER' | 'EDITOR' | 'VIEWER';
 export interface User {
   id: string;
   username: string;
+  email?: string;
+  password_hash?: string;
+  salt?: string;
+  avatar_color?: string;
   avatar_url?: string;
   created_at: string;
 }
@@ -12,6 +16,7 @@ export interface User {
 export interface UserTokenPayload {
   userId: string;
   username: string;
+  email?: string;
   iat?: number;
   exp?: number;
 }

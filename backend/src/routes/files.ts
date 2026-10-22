@@ -210,6 +210,99 @@ filesRouter.post('/:projectId', requireAuth, (req: AuthenticatedRequest, res: Re
 });
 
 /**
+ * POST /:projectId/upload
+ * Upload a file with content, language, and optional overwrite flag.
+ * Protected by requireAuth, RBAC check (block VIEWER), validateSafeFilename, and size check.
+ */
+filesRouter.post('/:projectId/upload', requireAuth, (req: AuthenticatedRequest, res: Response): void => {
+  try {
+    const { projectId } = req.params;
+    const { name, content, language, overwrite } = req.body;
+    const userId = req.user!.userId;
+    const username = req.user!.username;
+
+    const role = getCallerRole(projectId, userId);
+    if (!role) {
+      res.status(403).json({ error: 'Forbidden: You are not a member of this project' });
+      return;
+    }
+
+    // RBAC check: Block VIEWER
+    if (role === 'VIEWER') {
+      logSecurityEvent({
+        project_id: projectId,
+        user_id: userId,
+        username,
+        event_type: 'RBAC_VIOLATION_ATTEMPT',
+        severity: 'HIGH',
+        details: `VIEWER "${username}" attempted unauthorized file upload: "${name}"`,
+        blocked: 1
+      });
+      res.status(403).json({ error: 'Forbidden: VIEWER role cannot upload files' });
+      return;
+    }
+
+    if (!name || typeof name !== 'string') {
+      res.status(400).json({ error: 'File name is required' });
+      return;
+    }
+
+    const trimmedName = name.trim();
+
+    // Validate safe filename (block path traversal, null bytes, dotfiles)
+    if (!validateSafeFilename(trimmedName)) {
+      logSecurityEvent({
+        project_id: projectId,
+        user_id: userId,
+        username,
+        event_type: 'PATH_TRAVERSAL_BLOCKED',
+        severity: 'HIGH',
+        details: `Blocked unsafe filename in upload: "${trimmedName}"`,
+        blocked: 1
+      });
+      res.status(400).json({
+        error: 'Invalid or unsafe filename. Path traversal, null bytes, directory separators, and dotfiles are prohibited.'
+      });
+      return;
+    }
+
+    // Size limit check (2MB max for text code source)
+    const fileContent = typeof content === 'string' ? content : '';
+    if (fileContent.length > 2 * 1024 * 1024) {
+      res.status(413).json({ error: 'File exceeds maximum upload size limit of 2MB.' });
+      return;
+    }
+
+    const fileLang = language && typeof language === 'string' ? language.trim() : detectLanguage(trimmedName);
+    const existingFile = getFileByName(projectId, trimmedName);
+
+    if (existingFile) {
+      if (overwrite) {
+        updateFileContent(existingFile.id, fileContent);
+        const updated = getFileById(existingFile.id);
+        res.status(200).json({ file: updated, overwritten: true, message: `Overwrote "${trimmedName}"` });
+        return;
+      } else {
+        res.status(409).json({
+          error: `A file named "${trimmedName}" already exists in this project`,
+          fileId: existingFile.id,
+          fileName: trimmedName,
+          exists: true
+        });
+        return;
+      }
+    }
+
+    const newFileId = uuidv4();
+    const created = createFile(newFileId, projectId, trimmedName, fileLang, fileContent);
+
+    res.status(201).json({ file: created, overwritten: false, message: `Uploaded "${trimmedName}" successfully` });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to upload file', details: error.message });
+  }
+});
+
+/**
  * PUT /:projectId/:fileId
  * Update file content, metadata, or Yjs CRDT state
  * Protected by requireAuth, RBAC check (block VIEWER), and validateSafeFilename

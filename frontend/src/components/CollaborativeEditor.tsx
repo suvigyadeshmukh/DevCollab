@@ -39,6 +39,7 @@ interface CollaborativeEditorProps {
   socket: Socket | null;
   conflictBurstTrigger?: number; // Increment to trigger a CRDT burst test
   onCrdtOpsUpdate?: (ops: number, bytes: number) => void;
+  onCodeChange?: (code: string) => void;
 }
 
 interface ThreatMarker {
@@ -204,7 +205,8 @@ export const CollaborativeEditor: React.FC<CollaborativeEditorProps> = ({
   userRole,
   socket,
   conflictBurstTrigger = 0,
-  onCrdtOpsUpdate
+  onCrdtOpsUpdate,
+  onCodeChange
 }) => {
   const isViewer = userRole === 'VIEWER';
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -259,6 +261,20 @@ export const CollaborativeEditor: React.FC<CollaborativeEditorProps> = ({
     }, 3500);
   }, []);
 
+  // ── Emit CRDT incremental update over WS ─────────────────────────────────
+  const emitYjsUpdate = useCallback((update: Uint8Array) => {
+    if (!socket?.connected) return;
+    const updateBase64 = btoa(String.fromCharCode(...update));
+    socket.emit('yjs-update', {
+      projectId,
+      fileId: file.id,
+      updateBase64
+    });
+    crdtOpsRef.current += 1;
+    const stateSize = ytextRef.current ? new TextEncoder().encode(ytextRef.current.toString()).length : 0;
+    onCrdtOpsUpdate?.(crdtOpsRef.current, stateSize);
+  }, [socket, projectId, file.id, onCrdtOpsUpdate]);
+
   // ── Initialize / Reset Y.Doc on file change ────────────────────────────────
   const initYDoc = useCallback((yjsStateBase64?: string, initialContent?: string) => {
     // Dispose previous doc
@@ -271,54 +287,125 @@ export const CollaborativeEditor: React.FC<CollaborativeEditorProps> = ({
     const ytext = ydoc.getText('monaco');
     ytextRef.current = ytext;
 
+    // Listen to local transactions and emit incremental updates to peers
+    ydoc.on('update', (update: Uint8Array, origin: any) => {
+      // ONLY emit if change originated locally from Monaco and user is not VIEWER
+      if (origin === 'monaco' && socket?.connected && !isViewer) {
+        emitYjsUpdate(update);
+      }
+    });
+
     if (yjsStateBase64 && yjsStateBase64.length > 0) {
       // Hydrate from server binary state
       try {
         const binaryUpdate = Uint8Array.from(atob(yjsStateBase64), c => c.charCodeAt(0));
-        Y.applyUpdate(ydoc, binaryUpdate);
+        Y.applyUpdate(ydoc, binaryUpdate, 'init');
       } catch {
         // Fallback to plain text seed
         if (initialContent && ytext.length === 0) {
           ydoc.transact(() => {
             ytext.insert(0, initialContent);
-          });
+          }, 'init');
         }
       }
     } else if (initialContent && ytext.length === 0) {
       // Seed from plain text content when no Yjs state exists
       ydoc.transact(() => {
         ytext.insert(0, initialContent);
-      });
+      }, 'init');
     }
 
     return { ydoc, ytext };
-  }, []);
+  }, [emitYjsUpdate, socket, file.id, isViewer]);
 
   // ── Wire Y.Text observer -> Monaco model ──────────────────────────────────
   const wireYTextObserver = useCallback((ytext: Y.Text) => {
-    ytext.observe(() => {
-      if (isRemoteUpdateRef.current) {
-        // A remote WS update applied the Y.applyUpdate; now sync Monaco model
-        const editor = editorRef.current;
-        const model = editor?.getModel();
-        if (!editor || !model) return;
+    ytext.observe((event: Y.YTextEvent) => {
+      // If the change originated locally from Monaco, do not re-apply to Monaco
+      if (event.transaction.origin === 'monaco' || isYjsUpdateRef.current) return;
 
-        const newContent = ytext.toString();
-        if (model.getValue() === newContent) return;
+      const editor = editorRef.current;
+      const model = editor?.getModel();
+      const monacoInst = monacoRef.current;
+      if (!editor || !model || !monacoInst) return;
 
-        // Preserve cursor position before model replacement
+      // Translate Yjs OT delta to Monaco incremental edit operations
+      const delta = event.delta;
+      const edits: monaco.editor.IIdentifiedSingleEditOperation[] = [];
+      let index = 0;
+
+      for (let i = 0; i < delta.length; i++) {
+        const op = delta[i];
+        if (op.retain) {
+          index += op.retain;
+        } else if (op.delete) {
+          const nextOp = delta[i + 1];
+          if (nextOp && nextOp.insert && typeof nextOp.insert === 'string') {
+            // Replacement: delete + insert combined at current position
+            const startPos = model.getPositionAt(index);
+            const endPos = model.getPositionAt(index + op.delete);
+            edits.push({
+              range: new monacoInst.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column),
+              text: nextOp.insert,
+              forceMoveMarkers: true
+            });
+            index += op.delete;
+            i++; // consume nextOp
+          } else {
+            const startPos = model.getPositionAt(index);
+            const endPos = model.getPositionAt(index + op.delete);
+            edits.push({
+              range: new monacoInst.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column),
+              text: '',
+              forceMoveMarkers: true
+            });
+            index += op.delete;
+          }
+        } else if (op.insert && typeof op.insert === 'string') {
+          const nextOp = delta[i + 1];
+          if (nextOp && nextOp.delete) {
+            // Replacement: insert + delete combined at current position
+            const startPos = model.getPositionAt(index);
+            const endPos = model.getPositionAt(index + nextOp.delete);
+            edits.push({
+              range: new monacoInst.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column),
+              text: op.insert,
+              forceMoveMarkers: true
+            });
+            index += nextOp.delete;
+            i++; // consume nextOp
+          } else {
+            const pos = model.getPositionAt(index);
+            edits.push({
+              range: new monacoInst.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column),
+              text: op.insert,
+              forceMoveMarkers: true
+            });
+          }
+        }
+      }
+
+      if (edits.length > 0) {
+        isRemoteUpdateRef.current = true;
+        editor.executeEdits('yjs-remote', edits);
+        isRemoteUpdateRef.current = false;
+      }
+
+      // Safety check: ensure Monaco model exactly converges with Y.Text
+      const finalContent = ytext.toString();
+      if (model.getValue() !== finalContent) {
         const savedPosition = editor.getPosition();
-
-        isYjsUpdateRef.current = true;
-        model.setValue(newContent);
-        isYjsUpdateRef.current = false;
-
+        isRemoteUpdateRef.current = true;
+        model.setValue(finalContent);
+        isRemoteUpdateRef.current = false;
         if (savedPosition) {
           editor.setPosition(savedPosition);
         }
       }
+
+      onCodeChange?.(finalContent);
     });
-  }, []);
+  }, [onCodeChange]);
 
   // ── Scan code for security threats (debounced 300ms) ──────────────────────
   const scanForThreats = useCallback((code: string) => {
@@ -386,32 +473,54 @@ export const CollaborativeEditor: React.FC<CollaborativeEditorProps> = ({
         styleEl.id = styleId;
         styleEl.textContent = `
           .${cursorClass} {
-            border-left: 2px solid ${color};
+            border-left: 2px solid ${color} !important;
             box-shadow: 0 0 6px ${color}88;
+            margin-left: -1px;
+            pointer-events: none;
           }
           .${selectionClass} {
-            background-color: ${color}30;
+            background-color: ${color}35 !important;
+            border-radius: 2px;
+            pointer-events: none;
           }
           .${labelClass}::before {
             content: '${peer.username.replace(/'/g, "\\'")}';
             position: absolute;
-            top: -18px;
+            top: -20px;
             left: 0;
             background-color: ${color};
             color: #090D16;
-            font-size: 9px;
+            font-size: 10px;
             font-weight: 700;
-            padding: 1px 5px;
+            padding: 1px 6px;
             border-radius: 3px;
             white-space: nowrap;
             pointer-events: none;
-            font-family: 'Inter', sans-serif;
+            font-family: 'JetBrains Mono', monospace;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.5);
+            z-index: 100;
           }
         `;
         document.head.appendChild(styleEl);
       }
 
-      // Vertical cursor caret
+      // Selection Range decoration (if selection exists and is non-empty)
+      if (peer.selection && (peer.selection.startLineNumber !== peer.selection.endLineNumber || peer.selection.startColumn !== peer.selection.endColumn)) {
+        decorations.push({
+          range: new monacoInst.Range(
+            peer.selection.startLineNumber,
+            peer.selection.startColumn,
+            peer.selection.endLineNumber,
+            peer.selection.endColumn
+          ),
+          options: {
+            className: selectionClass,
+            stickiness: monacoInst.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges
+          }
+        });
+      }
+
+      // Vertical cursor caret and username label
       decorations.push({
         range: new monacoInst.Range(lineNum, colNum, lineNum, colNum),
         options: {
@@ -456,20 +565,6 @@ export const CollaborativeEditor: React.FC<CollaborativeEditorProps> = ({
     }
   }, []);
 
-  // ── Emit CRDT update over WS (encodes Yjs state vector update as base64) ──
-  const emitYjsUpdate = useCallback((update: Uint8Array) => {
-    if (!socket?.connected) return;
-    const updateBase64 = btoa(String.fromCharCode(...update));
-    socket.emit('yjs-update', {
-      projectId,
-      fileId: file.id,
-      updateBase64
-    });
-    crdtOpsRef.current += 1;
-    const stateSize = ytextRef.current ? new TextEncoder().encode(ytextRef.current.toString()).length : 0;
-    onCrdtOpsUpdate?.(crdtOpsRef.current, stateSize);
-  }, [socket, projectId, file.id, onCrdtOpsUpdate]);
-
   // ── Monaco Editor Mount ────────────────────────────────────────────────────
   const handleEditorDidMount: OnMount = useCallback((editor, monacoInst) => {
     editorRef.current = editor;
@@ -505,6 +600,9 @@ export const CollaborativeEditor: React.FC<CollaborativeEditorProps> = ({
     const model = editor.getModel();
     if (!model) return;
 
+    // Report initial content to parent component
+    onCodeChange?.(model.getValue());
+
     // ── Monaco onDidChangeModelContent → Yjs delta translation ──
     editor.onDidChangeModelContent((e) => {
       if (isYjsUpdateRef.current || isRemoteUpdateRef.current || isViewer) return;
@@ -514,6 +612,7 @@ export const CollaborativeEditor: React.FC<CollaborativeEditorProps> = ({
       if (!ytext || !ydoc) return;
 
       // Process each Monaco content change into Yjs text operations
+      isYjsUpdateRef.current = true;
       ydoc.transact(() => {
         // Changes must be applied in reverse offset order to keep offsets valid
         const changes = [...e.changes].sort((a, b) => b.rangeOffset - a.rangeOffset);
@@ -526,32 +625,47 @@ export const CollaborativeEditor: React.FC<CollaborativeEditorProps> = ({
             ytext.insert(rangeOffset, insertText);
           }
         }
-      });
+      }, 'monaco');
+      isYjsUpdateRef.current = false;
 
-      // Encode incremental update and emit to peers
-      const update = Y.encodeStateAsUpdate(ydoc);
-      emitYjsUpdate(update);
+      const currentVal = model.getValue();
+      onCodeChange?.(currentVal);
 
       // Run threat scan on current content
-      scanForThreats(model.getValue());
+      scanForThreats(currentVal);
     });
 
     // ── Cursor/Selection change → emit cursor-update (throttled 40ms) ────────
-    editor.onDidChangeCursorPosition((e) => {
+    const emitCursorUpdate = () => {
       if (cursorEmitTimerRef.current) clearTimeout(cursorEmitTimerRef.current);
       cursorEmitTimerRef.current = setTimeout(() => {
         if (!socket?.connected || !isMountedRef.current) return;
+        const pos = editor.getPosition();
+        if (!pos) return;
+        const sel = editor.getSelection();
+        const selectionData = sel && !sel.isEmpty() ? {
+          startLineNumber: sel.startLineNumber,
+          startColumn: sel.startColumn,
+          endLineNumber: sel.endLineNumber,
+          endColumn: sel.endColumn
+        } : undefined;
+
         socket.emit('cursor-update', {
           projectId,
           fileId: file.id,
-          lineNumber: e.position.lineNumber,
-          column: e.position.column
+          lineNumber: pos.lineNumber,
+          column: pos.column,
+          selection: selectionData
         });
       }, 40);
-    });
+    };
+
+    editor.onDidChangeCursorPosition(emitCursorUpdate);
+    editor.onDidChangeCursorSelection(emitCursorUpdate);
 
     // ── Glyph Margin Click → Toggle Breakpoint ────────────────────────────────
     editor.onMouseDown((e) => {
+      if (isViewer) return;
       if (e.target.type === monacoInst.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) {
         const lineNumber = e.target.position?.lineNumber;
         if (lineNumber && socket?.connected) {
@@ -566,7 +680,7 @@ export const CollaborativeEditor: React.FC<CollaborativeEditorProps> = ({
 
     // Initial threat scan on mount
     scanForThreats(model.getValue());
-  }, [isViewer, socket, projectId, file.id, emitYjsUpdate, scanForThreats]);
+  }, [isViewer, socket, projectId, file.id, emitYjsUpdate, scanForThreats, onCodeChange]);
 
   // ── Wire up Socket.IO events ───────────────────────────────────────────────
   useEffect(() => {
@@ -595,6 +709,7 @@ export const CollaborativeEditor: React.FC<CollaborativeEditorProps> = ({
           model.setValue(yjsContent);
           isYjsUpdateRef.current = false;
         }
+        onCodeChange?.(model.getValue());
         scanForThreats(model.getValue());
       }
 
@@ -635,7 +750,10 @@ export const CollaborativeEditor: React.FC<CollaborativeEditorProps> = ({
         // Re-scan for threats after remote update
         const editor = editorRef.current;
         const model = editor?.getModel();
-        if (model) scanForThreats(model.getValue());
+        if (model) {
+          onCodeChange?.(model.getValue());
+          scanForThreats(model.getValue());
+        }
 
         const stateSize = new TextEncoder().encode(ytext.toString()).length;
         onCrdtOpsUpdate?.(crdtOpsRef.current, stateSize);
@@ -753,20 +871,16 @@ export const CollaborativeEditor: React.FC<CollaborativeEditorProps> = ({
         ydocRef.current.transact(() => {
           const insertPos = ytextRef.current!.length;
           ytextRef.current!.insert(insertPos, '\n' + line);
-        });
+        }, 'monaco');
 
         // Sync Monaco model
         const editor = editorRef.current;
         const model = editor?.getModel();
-        if (editor && model) {
+        if (editor && model && ytextRef.current) {
           isYjsUpdateRef.current = true;
-          model.setValue(ytextRef.current!.toString());
+          model.setValue(ytextRef.current.toString());
           isYjsUpdateRef.current = false;
         }
-
-        // Emit update to peers
-        const update = Y.encodeStateAsUpdate(ydocRef.current!);
-        emitYjsUpdate(update);
       }, delay);
       delay += 120;
     }

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import {
   FileCode,
   Folder,
@@ -13,7 +13,10 @@ import {
   FileText,
   FileJson,
   Code2,
-  AlertCircle
+  AlertCircle,
+  Upload,
+  UploadCloud,
+  Loader2
 } from 'lucide-react';
 import {
   CollaboratorRole,
@@ -26,6 +29,7 @@ import {
   deleteFile,
   updateFile,
   updateCollaboratorRole,
+  uploadProjectFile,
   cn
 } from '../services/api';
 
@@ -73,6 +77,12 @@ export const SidebarFileTree: React.FC<SidebarFileTreeProps> = ({
   // Collaborator Role Manager footer expand state
   const [roleManagerOpen, setRoleManagerOpen] = useState(false);
   const [roleUpdateMsg, setRoleUpdateMsg] = useState<string | null>(null);
+
+  // File Upload states
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadFeedback, setUploadFeedback] = useState<{ text: string; isError?: boolean } | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
 
   // Group active peers by fileId
   const peersByFile = activePeers.reduce<Record<string, CursorPosition[]>>((acc, peer) => {
@@ -126,6 +136,104 @@ export const SidebarFileTree: React.FC<SidebarFileTreeProps> = ({
       setCreateError(err.response?.data?.error || err.message || 'File creation failed');
     } finally {
       setCreating(false);
+    }
+  };
+
+  // Handle File Uploads (Multiple files, size validation, overwrite prompt)
+  const handleProcessFiles = async (fileList: FileList | File[]) => {
+    if (isViewer) {
+      setUploadFeedback({ text: 'RBAC Violation: VIEWER role cannot upload files.', isError: true });
+      setTimeout(() => setUploadFeedback(null), 3500);
+      return;
+    }
+
+    const filesToUpload = Array.from(fileList);
+    if (filesToUpload.length === 0) return;
+
+    setUploading(true);
+    setUploadFeedback(null);
+
+    let successCount = 0;
+    let lastUploaded: ProjectFile | null = null;
+    let lastErrorMessage: string | null = null;
+
+    for (const file of filesToUpload) {
+      try {
+        const result = await uploadProjectFile(projectId, file, false);
+        successCount++;
+        lastUploaded = result.file;
+      } catch (err: any) {
+        // If file already exists (409), prompt user to overwrite
+        if (err.response?.status === 409) {
+          const shouldOverwrite = window.confirm(
+            `A file named "${file.name}" already exists in this project. Do you want to overwrite it?`
+          );
+          if (shouldOverwrite) {
+            try {
+              const resOverwrite = await uploadProjectFile(projectId, file, true);
+              successCount++;
+              lastUploaded = resOverwrite.file;
+              continue;
+            } catch (errOver: any) {
+              lastErrorMessage = errOver.response?.data?.error || errOver.message;
+            }
+          }
+        } else {
+          lastErrorMessage = err.response?.data?.error || err.message;
+        }
+      }
+    }
+
+    await onRefreshFiles();
+
+    if (lastUploaded) {
+      onSelectFile(lastUploaded);
+    }
+
+    if (successCount > 0) {
+      setUploadFeedback({
+        text: `Uploaded ${successCount} file${successCount > 1 ? 's' : ''} successfully!`,
+        isError: false
+      });
+    } else if (lastErrorMessage) {
+      setUploadFeedback({ text: lastErrorMessage, isError: true });
+    }
+
+    setTimeout(() => setUploadFeedback(null), 4000);
+    setUploading(false);
+  };
+
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      handleProcessFiles(e.target.files);
+      e.target.value = '';
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    if (!isViewer && !isDragging) {
+      setIsDragging(true);
+    }
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+      setIsDragging(false);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (isViewer) {
+      setUploadFeedback({ text: 'RBAC Violation: VIEWER role cannot upload files.', isError: true });
+      setTimeout(() => setUploadFeedback(null), 3500);
+      return;
+    }
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      handleProcessFiles(e.dataTransfer.files);
     }
   };
 
@@ -216,7 +324,7 @@ export const SidebarFileTree: React.FC<SidebarFileTreeProps> = ({
           </span>
         </div>
 
-        {/* Project Name + New File Button */}
+        {/* Project Name + New File & Upload Buttons */}
         <div className="p-3 flex items-center justify-between">
           <div className="flex items-center space-x-2 min-w-0">
             <Folder className="h-4 w-4 text-neon-cyan shrink-0" />
@@ -225,25 +333,93 @@ export const SidebarFileTree: React.FC<SidebarFileTreeProps> = ({
             </span>
           </div>
 
-          <button
-            onClick={() => {
-              if (isViewer) return;
-              setShowCreateModal(true);
-            }}
-            disabled={isViewer}
-            title={isViewer ? 'RBAC Locked: VIEWER cannot create files' : 'Create new file'}
-            className={cn(
-              "p-1 rounded text-obsidian-400 hover:text-white hover:bg-obsidian-800 transition",
-              isViewer && "opacity-40 cursor-not-allowed hover:bg-transparent hover:text-obsidian-400"
-            )}
-          >
-            {isViewer ? <Lock className="h-3.5 w-3.5 text-obsidian-500" /> : <Plus className="h-3.5 w-3.5" />}
-          </button>
+          <div className="flex items-center space-x-1">
+            {/* Hidden file input */}
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleFileInputChange}
+              multiple
+              className="hidden"
+            />
+
+            {/* Upload File CTA */}
+            <button
+              onClick={() => {
+                if (isViewer || uploading) return;
+                fileInputRef.current?.click();
+              }}
+              disabled={isViewer || uploading}
+              title={isViewer ? 'RBAC Locked: VIEWER cannot upload files' : 'Upload source files (multiple supported)'}
+              className={cn(
+                "p-1 rounded text-obsidian-400 hover:text-neon-cyan hover:bg-obsidian-800 transition",
+                (isViewer || uploading) && "opacity-40 cursor-not-allowed hover:bg-transparent hover:text-obsidian-400"
+              )}
+            >
+              {uploading ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-neon-cyan" />
+              ) : (
+                <Upload className="h-3.5 w-3.5" />
+              )}
+            </button>
+
+            {/* Create New File CTA */}
+            <button
+              onClick={() => {
+                if (isViewer) return;
+                setShowCreateModal(true);
+              }}
+              disabled={isViewer}
+              title={isViewer ? 'RBAC Locked: VIEWER cannot create files' : 'Create new file'}
+              className={cn(
+                "p-1 rounded text-obsidian-400 hover:text-white hover:bg-obsidian-800 transition",
+                isViewer && "opacity-40 cursor-not-allowed hover:bg-transparent hover:text-obsidian-400"
+              )}
+            >
+              {isViewer ? <Lock className="h-3.5 w-3.5 text-obsidian-500" /> : <Plus className="h-3.5 w-3.5" />}
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* ─── File Explorer Tree ─── */}
-      <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
+      {/* ─── File Explorer Tree (With Drag & Drop Zone) ─── */}
+      <div
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        className={cn(
+          "flex-1 overflow-y-auto p-2 space-y-0.5 relative transition-colors",
+          isDragging && "bg-neon-cyan/5 ring-1 ring-inset ring-neon-cyan/40"
+        )}
+      >
+        {/* Drag Overlay */}
+        {isDragging && (
+          <div className="absolute inset-2 z-20 flex flex-col items-center justify-center rounded-lg border-2 border-dashed border-neon-cyan/70 bg-obsidian-950/90 backdrop-blur-sm p-4 text-center pointer-events-none">
+            <UploadCloud className="h-8 w-8 text-neon-cyan animate-bounce mb-2" />
+            <p className="text-xs font-bold text-white">Drop files to upload</p>
+            <p className="text-[10px] text-obsidian-400 mt-1">C++, Python, JS/TS, etc. (max 2MB)</p>
+          </div>
+        )}
+
+        {/* Upload Feedback Alert */}
+        {uploadFeedback && (
+          <div
+            className={cn(
+              "mb-2 p-2 rounded text-[11px] font-medium border flex items-center space-x-1.5 animate-in fade-in",
+              uploadFeedback.isError
+                ? "bg-rose-950/40 border-rose-500/40 text-rose-300"
+                : "bg-emerald-950/40 border-emerald-500/40 text-emerald-300"
+            )}
+          >
+            {uploadFeedback.isError ? (
+              <AlertCircle className="h-3.5 w-3.5 shrink-0 text-rose-400" />
+            ) : (
+              <Check className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+            )}
+            <span className="truncate">{uploadFeedback.text}</span>
+          </div>
+        )}
+
         <div className="text-[10px] font-mono text-obsidian-500 px-2 py-1 tracking-wider uppercase font-semibold">
           EXPLORER ({files.length})
         </div>
@@ -329,7 +505,9 @@ export const SidebarFileTree: React.FC<SidebarFileTreeProps> = ({
                   )}
 
                   {isViewer && (
-                    <Lock className="h-3 w-3 text-obsidian-600 opacity-60" title="Read-only" />
+                    <span title="Read-only">
+                      <Lock className="h-3 w-3 text-obsidian-600 opacity-60" />
+                    </span>
                   )}
                 </div>
               </div>
@@ -442,21 +620,35 @@ export const SidebarFileTree: React.FC<SidebarFileTreeProps> = ({
                 />
               </div>
 
-              <div className="flex items-center justify-end space-x-2 pt-1">
+              <div className="flex items-center justify-between pt-1">
                 <button
                   type="button"
-                  onClick={() => setShowCreateModal(false)}
-                  className="px-3 py-1.5 rounded-lg text-xs text-obsidian-400 hover:text-white"
+                  onClick={() => {
+                    setShowCreateModal(false);
+                    fileInputRef.current?.click();
+                  }}
+                  className="flex items-center space-x-1 text-[11px] text-neon-cyan hover:underline"
                 >
-                  Cancel
+                  <Upload className="h-3 w-3" />
+                  <span>Or upload from disk</span>
                 </button>
-                <button
-                  type="submit"
-                  disabled={creating || !newFileName.trim()}
-                  className="px-4 py-1.5 rounded-lg bg-neon-cyan text-obsidian-950 font-bold text-xs uppercase tracking-wider disabled:opacity-50 transition"
-                >
-                  {creating ? 'Creating...' : 'Create'}
-                </button>
+
+                <div className="flex items-center space-x-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowCreateModal(false)}
+                    className="px-3 py-1.5 rounded-lg text-xs text-obsidian-400 hover:text-white"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={creating || !newFileName.trim()}
+                    className="px-4 py-1.5 rounded-lg bg-neon-cyan text-obsidian-950 font-bold text-xs uppercase tracking-wider disabled:opacity-50 transition"
+                  >
+                    {creating ? 'Creating...' : 'Create'}
+                  </button>
+                </div>
               </div>
             </form>
           </div>

@@ -43,6 +43,7 @@ interface VersionHistoryModalProps {
   userRole: CollaboratorRole;
   username: string;
   socket: Socket | null;
+  onSnapshotRestored?: () => void;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -125,7 +126,8 @@ export const VersionHistoryModal: React.FC<VersionHistoryModalProps> = ({
   liveCode,
   userRole,
   username,
-  socket
+  socket,
+  onSnapshotRestored
 }) => {
   const [snapshots, setSnapshots] = useState<VersionSnapshot[]>([]);
   const [loadingSnapshots, setLoadingSnapshots] = useState(false);
@@ -241,6 +243,9 @@ export const VersionHistoryModal: React.FC<VersionHistoryModalProps> = ({
 
     try {
       const result = await restoreSnapshot(projectId, selectedSnapshot.id);
+
+      // Trigger parent file refresh immediately
+      onSnapshotRestored?.();
 
       // Notify all peers via Socket.IO
       if (socket?.connected) {

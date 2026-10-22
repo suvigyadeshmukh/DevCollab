@@ -191,6 +191,8 @@ export const ExecutionConsole: React.FC<ExecutionConsoleProps> = ({
       setIsRunning(true);
       setRemoteRunnerName(data.username);
       setThreatStatus('READY');
+      setActiveTab('output');
+      setIsCollapsed(false);
     };
 
     const handleExecutionResult = (data: {
@@ -203,6 +205,8 @@ export const ExecutionConsole: React.FC<ExecutionConsoleProps> = ({
       if (data.projectId !== projectId) return;
       setIsRunning(false);
       setRemoteRunnerName(null);
+      setActiveTab('output');
+      setIsCollapsed(false);
 
       const res = data.result;
       setStdout(res.stdout || '');

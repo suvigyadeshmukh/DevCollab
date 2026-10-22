@@ -4,6 +4,7 @@ import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 
+import { authRouter } from './routes/auth';
 import { projectsRouter } from './routes/projects';
 import { filesRouter } from './routes/files';
 import { createExecuteRouter } from './routes/execute';
@@ -112,6 +113,7 @@ app.get('/health', (_req, res) => {
 });
 
 // Mount routers
+app.use('/api/auth', authRouter);
 app.use('/api/projects', projectsRouter);
 app.use('/api/files', filesRouter);
 app.use('/api/execute', createExecuteRouter(io));

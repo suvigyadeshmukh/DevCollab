@@ -27,7 +27,7 @@ export function cn(...inputs: ClassValue[]): string {
 
 // ─── Axios Instance Setup ─────────────────────────────────────────────────────
 
-const BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
+const BASE_URL = (import.meta as any).env?.VITE_API_BASE_URL || '/api';
 
 export const api = axios.create({
   baseURL: BASE_URL,
@@ -54,14 +54,49 @@ api.interceptors.response.use(
   (response) => response,
   (error: AxiosError) => {
     if (error.response?.status === 401) {
-      // Token expired or invalid
       console.warn('[API] 401 Unauthorized - Token may be expired');
+      if (!error.config?.url?.includes('/auth/login') && !error.config?.url?.includes('/auth/register')) {
+        authAPI.logout();
+      }
     }
     return Promise.reject(error);
   }
 );
 
-// ─── Session & Persona Management ─────────────────────────────────────────────
+// ─── Authentication API (Zero-Trust Email & Password Gate) ───────────────────
+
+export const authAPI = {
+  async register(username: string, email: string, password: string): Promise<{ token: string; user: User }> {
+    const res = await api.post('/auth/register', { username, email, password });
+    const { token, user } = res.data;
+    localStorage.setItem('devcollab_token', token);
+    localStorage.setItem('devcollab_user', JSON.stringify(user));
+    return { token, user };
+  },
+
+  async login(emailOrUsername: string, password: string): Promise<{ token: string; user: User }> {
+    const res = await api.post('/auth/login', { emailOrUsername, password });
+    const { token, user } = res.data;
+    localStorage.setItem('devcollab_token', token);
+    localStorage.setItem('devcollab_user', JSON.stringify(user));
+    return { token, user };
+  },
+
+  async getMe(): Promise<{ user: User }> {
+    const res = await api.get('/auth/me');
+    const { user } = res.data;
+    localStorage.setItem('devcollab_user', JSON.stringify(user));
+    return { user };
+  },
+
+  logout(): void {
+    localStorage.removeItem('devcollab_token');
+    localStorage.removeItem('devcollab_user');
+    localStorage.removeItem('devcollab_active_persona');
+  }
+};
+
+// ─── Session Helpers ─────────────────────────────────────────────────────────
 
 export const DEFAULT_PERSONAS: Persona[] = [
   {
@@ -137,9 +172,7 @@ export function getActivePersona(): Persona {
 }
 
 export function clearSession(): void {
-  localStorage.removeItem('devcollab_token');
-  localStorage.removeItem('devcollab_user');
-  localStorage.removeItem('devcollab_active_persona');
+  authAPI.logout();
 }
 
 // ─── Project Endpoints ────────────────────────────────────────────────────────
@@ -217,6 +250,49 @@ export async function deleteFile(
 ): Promise<{ message: string; fileId: string; name: string }> {
   const res = await api.delete(`/files/${projectId}/${fileId}`);
   return res.data;
+}
+
+export async function uploadFile(
+  projectId: string,
+  name: string,
+  content: string,
+  language?: string,
+  overwrite?: boolean
+): Promise<{ file: ProjectFile; overwritten: boolean; message: string }> {
+  const res = await api.post(`/files/${projectId}/upload`, {
+    name,
+    content,
+    language,
+    overwrite
+  });
+  return res.data;
+}
+
+export async function uploadProjectFile(
+  projectId: string,
+  file: File,
+  overwrite?: boolean
+): Promise<{ file: ProjectFile; overwritten: boolean; message: string }> {
+  return new Promise((resolve, reject) => {
+    // 2MB size pre-check
+    if (file.size > 2 * 1024 * 1024) {
+      reject(new Error(`"${file.name}" exceeds maximum allowed upload size (2MB).`));
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const content = String(reader.result || '');
+        const data = await uploadFile(projectId, file.name, content, undefined, overwrite);
+        resolve(data);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    reader.onerror = () => reject(new Error(`Failed to read "${file.name}" from filesystem.`));
+    reader.readAsText(file);
+  });
 }
 
 // ─── Snapshot Endpoints ───────────────────────────────────────────────────────

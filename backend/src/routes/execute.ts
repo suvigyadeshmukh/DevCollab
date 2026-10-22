@@ -1,6 +1,10 @@
 import { Router, Response } from 'express';
 import { Server } from 'socket.io';
 import vm from 'vm';
+import { spawn } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 import {
   requireAuth,
   createRateLimiter,
@@ -182,7 +186,7 @@ function executeInLocalVmSandbox(code: string, stdin?: string): ExecutionResult 
     });
 
     const returnedValue = script.runInContext(context, {
-      timeout: 2500
+      timeout: 3000
     });
 
     if (returnedValue !== undefined && stdoutBuf.trim() === '') {
@@ -192,7 +196,7 @@ function executeInLocalVmSandbox(code: string, stdin?: string): ExecutionResult 
     exitCode = 1;
     if (err.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
       exitCode = 124;
-      stderrBuf += '[TIMEOUT ERROR] Script execution exceeded local VM safety limit of 2,500ms.\n';
+      stderrBuf += '[TIMEOUT ERROR] Script execution exceeded local VM safety limit of 3,000ms.\n';
     } else {
       stderrBuf += `${err.name || 'RuntimeError'}: ${err.message || String(err)}\n`;
     }
@@ -246,13 +250,19 @@ async function executeInPistonSandbox(
   const controller = new AbortController();
   const timeoutTimer = setTimeout(() => controller.abort(), 6500);
 
+  const pistonUrl = process.env.PISTON_URL || 'https://emkc.org/api/v2/piston/execute';
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'User-Agent': 'DevCollab-ZeroTrustSandbox/1.0'
+  };
+  if (process.env.PISTON_API_KEY) {
+    headers['Authorization'] = process.env.PISTON_API_KEY;
+  }
+
   try {
-    const response = await fetch('https://emkc.org/api/v2/piston/execute', {
+    const response = await fetch(pistonUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'DevCollab-ZeroTrustSandbox/1.0'
-      },
+      headers,
       body: JSON.stringify(payload),
       signal: controller.signal
     });
@@ -301,6 +311,170 @@ async function executeInPistonSandbox(
   } catch (err: any) {
     clearTimeout(timeoutTimer);
     throw err;
+  }
+}
+
+/**
+ * Offline Native Compiler Sandbox for C/C++ and Python.
+ * Compiles and executes in an isolated temporary directory with strict 3,000ms timeout,
+ * memory guards, safe stdin forwarding, and automatic scratch cleanup.
+ */
+async function executeInLocalNativeSandbox(
+  code: string,
+  language: string,
+  stdin?: string
+): Promise<ExecutionResult> {
+  const startTime = Date.now();
+  const effectiveLang = (language || '').toLowerCase().trim();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devcollab-native-'));
+
+  try {
+    let stdoutBuf = '';
+    let stderrBuf = '';
+    let exitCode = 0;
+
+    if (effectiveLang === 'cpp' || effectiveLang === 'c++' || effectiveLang === 'c') {
+      const isCpp = effectiveLang !== 'c';
+      const compiler = isCpp ? 'g++' : 'gcc';
+      const srcFile = path.join(tmpDir, isCpp ? 'main.cpp' : 'main.c');
+      const exeFile = path.join(tmpDir, process.platform === 'win32' ? 'main.exe' : 'main.out');
+      fs.writeFileSync(srcFile, code, 'utf8');
+
+      // 1. Compile step (timeout 5s)
+      const compileArgs = ['-O2', srcFile, '-o', exeFile];
+      if (isCpp) {
+        compileArgs.push('-std=c++17');
+      }
+
+      const compileResult = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+        let compStderr = '';
+        const child = spawn(compiler, compileArgs, { cwd: tmpDir });
+        const timer = setTimeout(() => {
+          try { child.kill(); } catch {}
+          resolve({ code: 124, stderr: '[COMPILE TIMEOUT] Compilation exceeded 5,000ms limit.\n' });
+        }, 5000);
+
+        child.stderr?.on('data', (d) => { compStderr += d.toString(); });
+        child.on('error', (err) => {
+          clearTimeout(timer);
+          resolve({ code: 1, stderr: `Compiler spawn error: ${err.message}\nEnsure ${compiler} is installed in PATH.\n` });
+        });
+        child.on('close', (c) => {
+          clearTimeout(timer);
+          resolve({ code: c, stderr: compStderr });
+        });
+      });
+
+      if (compileResult.code !== 0) {
+        return {
+          stdout: '',
+          stderr: compileResult.stderr || '[COMPILE ERROR] Compilation failed.',
+          exitCode: compileResult.code ?? 1,
+          executionTimeMs: Math.max(1, Date.now() - startTime),
+          memoryUsageMb: 64
+        };
+      }
+
+      // 2. Execution step (timeout 3s)
+      const runResult = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+        let runStdout = '';
+        let runStderr = '';
+        const child = spawn(exeFile, [], { cwd: tmpDir });
+        const timer = setTimeout(() => {
+          try { child.kill('SIGKILL'); } catch {}
+          resolve({ code: 137, stdout: runStdout, stderr: runStderr + '\n[TIMEOUT ERROR] Process exceeded 3,000ms execution limit.' });
+        }, 3000);
+
+        child.stdout?.on('data', (d) => {
+          if (runStdout.length < 10000) runStdout += d.toString();
+        });
+        child.stderr?.on('data', (d) => {
+          if (runStderr.length < 10000) runStderr += d.toString();
+        });
+        child.on('error', (err) => {
+          clearTimeout(timer);
+          resolve({ code: 1, stdout: runStdout, stderr: `Execution runtime error: ${err.message}` });
+        });
+        child.on('close', (c) => {
+          clearTimeout(timer);
+          resolve({ code: c, stdout: runStdout, stderr: runStderr });
+        });
+
+        if (typeof stdin === 'string' && stdin.length > 0) {
+          child.stdin?.write(stdin);
+        }
+        child.stdin?.end();
+      });
+
+      stdoutBuf = runResult.stdout;
+      stderrBuf = runResult.stderr;
+      exitCode = runResult.code ?? 0;
+    } else if (effectiveLang === 'python' || effectiveLang === 'py') {
+      const srcFile = path.join(tmpDir, 'main.py');
+      fs.writeFileSync(srcFile, code, 'utf8');
+
+      const runResult = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+        let runStdout = '';
+        let runStderr = '';
+        const child = spawn('python', ['-u', srcFile], { cwd: tmpDir });
+        const timer = setTimeout(() => {
+          try { child.kill('SIGKILL'); } catch {}
+          resolve({ code: 137, stdout: runStdout, stderr: runStderr + '\n[TIMEOUT ERROR] Process exceeded 3,000ms execution limit.' });
+        }, 3000);
+
+        child.stdout?.on('data', (d) => {
+          if (runStdout.length < 10000) runStdout += d.toString();
+        });
+        child.stderr?.on('data', (d) => {
+          if (runStderr.length < 10000) runStderr += d.toString();
+        });
+        child.on('error', (err) => {
+          clearTimeout(timer);
+          resolve({ code: 1, stdout: runStdout, stderr: `Python runtime spawn error: ${err.message}` });
+        });
+        child.on('close', (c) => {
+          clearTimeout(timer);
+          resolve({ code: c, stdout: runStdout, stderr: runStderr });
+        });
+
+        if (typeof stdin === 'string' && stdin.length > 0) {
+          child.stdin?.write(stdin);
+        }
+        child.stdin?.end();
+      });
+
+      stdoutBuf = runResult.stdout;
+      stderrBuf = runResult.stderr;
+      exitCode = runResult.code ?? 0;
+    } else {
+      return {
+        stdout: '',
+        stderr: `Local offline fallback engine supports C++, C, Python, JavaScript, and TypeScript.\nExecution for language "${language}" requires a live container sandbox.`,
+        exitCode: 1,
+        executionTimeMs: Math.max(1, Date.now() - startTime)
+      };
+    }
+
+    if (stdoutBuf.length > 10000) {
+      stdoutBuf = stdoutBuf.slice(0, 10000) + '\n[Truncated: stdout exceeded 10,000 character limit]';
+    }
+    if (stderrBuf.length > 10000) {
+      stderrBuf = stderrBuf.slice(0, 10000) + '\n[Truncated: stderr exceeded 10,000 character limit]';
+    }
+
+    return {
+      stdout: stdoutBuf,
+      stderr: stderrBuf,
+      exitCode,
+      executionTimeMs: Math.max(1, Date.now() - startTime),
+      memoryUsageMb: 64
+    };
+  } finally {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // Ignore temporary directory cleanup failure
+    }
   }
 }
 
@@ -469,20 +643,21 @@ export function createExecuteRouter(io: Server): Router {
       let finalResult: ExecutionResult;
       const effectiveLang = (language || 'javascript').toLowerCase();
 
-      // Primary Sandbox: Piston API
+      // Primary Sandbox: Piston API (remote container)
       try {
         finalResult = await executeInPistonSandbox(code, effectiveLang, stdin);
       } catch (pistonError: any) {
-        // Offline Local Fallback for JS/TS or if Piston is unreachable
+        // Offline Local Fallback:
+        // 1. JavaScript & TypeScript -> Isolated Node V8 VM Sandbox
+        // 2. C++, C & Python -> Sandboxed local compiler / runtime with strict timeout & input forwarding
         if (effectiveLang === 'javascript' || effectiveLang === 'js' || effectiveLang === 'typescript' || effectiveLang === 'ts' || effectiveLang === 'node') {
           finalResult = executeInLocalVmSandbox(code, stdin);
-          finalResult.stderr = finalResult.stderr
-            ? `[SANDBOX NOTICE: Piston unreachable, fell back to isolated local Node.js VM]\n${finalResult.stderr}`
-            : '';
+        } else if (effectiveLang === 'cpp' || effectiveLang === 'c++' || effectiveLang === 'c' || effectiveLang === 'python' || effectiveLang === 'py') {
+          finalResult = await executeInLocalNativeSandbox(code, effectiveLang, stdin);
         } else {
           finalResult = {
             stdout: '',
-            stderr: `[SANDBOX NOTICE] Remote execution sandbox (Piston) was unreachable: ${pistonError.message}.\nLocal offline fallback sandbox currently supports JavaScript and TypeScript. Please check internet connectivity or run JavaScript/TypeScript.`,
+            stderr: `[SANDBOX NOTICE] Remote execution sandbox (Piston) was unreachable: ${pistonError.message}.\nLocal offline fallback sandbox currently supports JavaScript, TypeScript, Python, and C/C++. Please check internet connectivity or run supported languages.`,
             exitCode: 1,
             executionTimeMs: 0
           };

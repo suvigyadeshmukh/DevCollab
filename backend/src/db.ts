@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
+import { hashPassword } from './security/securityMiddleware';
 import {
   CollaboratorRole,
   InlineComment,
@@ -24,6 +25,10 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     username TEXT UNIQUE NOT NULL,
+    email TEXT UNIQUE,
+    password_hash TEXT,
+    salt TEXT,
+    avatar_color TEXT,
     avatar_url TEXT,
     created_at TEXT NOT NULL
   );
@@ -99,22 +104,53 @@ db.exec(`
   );
 `);
 
+// Safe column migrations for existing databases
+try {
+  const tableInfo = db.prepare(`PRAGMA table_info(users)`).all() as Array<{ name: string }>;
+  const colNames = tableInfo.map(c => c.name);
+  if (!colNames.includes('email')) {
+    db.prepare(`ALTER TABLE users ADD COLUMN email TEXT`).run();
+    db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)`).run();
+  }
+  if (!colNames.includes('password_hash')) {
+    db.prepare(`ALTER TABLE users ADD COLUMN password_hash TEXT`).run();
+  }
+  if (!colNames.includes('salt')) {
+    db.prepare(`ALTER TABLE users ADD COLUMN salt TEXT`).run();
+  }
+  if (!colNames.includes('avatar_color')) {
+    db.prepare(`ALTER TABLE users ADD COLUMN avatar_color TEXT`).run();
+  }
+} catch {
+  // column check fallback
+}
+
 // 2. 100% Prepared Statements
 const stmts = {
   // Users
   insertUser: db.prepare(`
-    INSERT INTO users (id, username, avatar_url, created_at)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO users (id, username, email, password_hash, salt, avatar_color, avatar_url, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `),
   getUserById: db.prepare(`
-    SELECT id, username, avatar_url, created_at
+    SELECT id, username, email, password_hash, salt, avatar_color, avatar_url, created_at
     FROM users
     WHERE id = ?
   `),
   getUserByUsername: db.prepare(`
-    SELECT id, username, avatar_url, created_at
+    SELECT id, username, email, password_hash, salt, avatar_color, avatar_url, created_at
     FROM users
     WHERE username = ?
+  `),
+  getUserByEmail: db.prepare(`
+    SELECT id, username, email, password_hash, salt, avatar_color, avatar_url, created_at
+    FROM users
+    WHERE LOWER(email) = LOWER(?)
+  `),
+  getUserByIdentifier: db.prepare(`
+    SELECT id, username, email, password_hash, salt, avatar_color, avatar_url, created_at
+    FROM users
+    WHERE LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)
   `),
 
   // Projects
@@ -133,7 +169,7 @@ const stmts = {
     WHERE invite_code = ?
   `),
   getUserProjects: db.prepare(`
-    SELECT p.id, p.name, p.description, p.invite_code, p.owner_id, p.created_at, pm.role
+    SELECT p.*, pm.role
     FROM projects p
     JOIN project_members pm ON p.id = pm.project_id
     WHERE pm.user_id = ?
@@ -281,10 +317,36 @@ const stmts = {
 
 // 3. Typed Data Access Layer with Prepared Statements
 
-export function createUser(id: string, username: string, avatarUrl?: string): User {
+export function createUser(
+  id: string,
+  username: string,
+  email?: string,
+  passwordHash?: string,
+  salt?: string,
+  avatarColor?: string,
+  avatarUrl?: string
+): User {
   const createdAt = new Date().toISOString();
-  stmts.insertUser.run(id, username, avatarUrl || null, createdAt);
-  return { id, username, avatar_url: avatarUrl, created_at: createdAt };
+  stmts.insertUser.run(
+    id,
+    username,
+    email || null,
+    passwordHash || null,
+    salt || null,
+    avatarColor || null,
+    avatarUrl || null,
+    createdAt
+  );
+  return {
+    id,
+    username,
+    email: email || undefined,
+    password_hash: passwordHash || undefined,
+    salt: salt || undefined,
+    avatar_color: avatarColor || undefined,
+    avatar_url: avatarUrl || undefined,
+    created_at: createdAt
+  };
 }
 
 export function getUserById(id: string): User | null {
@@ -293,6 +355,10 @@ export function getUserById(id: string): User | null {
   return {
     id: row.id,
     username: row.username,
+    email: row.email,
+    password_hash: row.password_hash,
+    salt: row.salt,
+    avatar_color: row.avatar_color,
     avatar_url: row.avatar_url,
     created_at: row.created_at
   };
@@ -304,6 +370,40 @@ export function getUserByUsername(username: string): User | null {
   return {
     id: row.id,
     username: row.username,
+    email: row.email,
+    password_hash: row.password_hash,
+    salt: row.salt,
+    avatar_color: row.avatar_color,
+    avatar_url: row.avatar_url,
+    created_at: row.created_at
+  };
+}
+
+export function getUserByEmail(email: string): User | null {
+  const row = stmts.getUserByEmail.get(email) as any;
+  if (!row) return null;
+  return {
+    id: row.id,
+    username: row.username,
+    email: row.email,
+    password_hash: row.password_hash,
+    salt: row.salt,
+    avatar_color: row.avatar_color,
+    avatar_url: row.avatar_url,
+    created_at: row.created_at
+  };
+}
+
+export function getUserByIdentifier(identifier: string): User | null {
+  const row = stmts.getUserByIdentifier.get(identifier, identifier) as any;
+  if (!row) return null;
+  return {
+    id: row.id,
+    username: row.username,
+    email: row.email,
+    password_hash: row.password_hash,
+    salt: row.salt,
+    avatar_color: row.avatar_color,
     avatar_url: row.avatar_url,
     created_at: row.created_at
   };
@@ -697,21 +797,63 @@ export function getSecurityLogs(projectId?: string, limit: number = 50): Securit
 
 // 4. Seed Seed Initial Demo Project ("Quantum Router Engine")
 function seedDatabase() {
-  const demoProjectId = 'demo-quantum-router';
-  const existingProject = getProjectById(demoProjectId);
-  if (existingProject) {
-    return;
+  const adminId = 'user-admin-default';
+  const adminEmail = 'admin@devcollab.io';
+  const adminUsername = 'Admin';
+  const adminColor = '#00F0FF';
+
+  let adminUser = getUserByEmail(adminEmail) || getUserById(adminId);
+  if (!adminUser) {
+    const { salt, hash } = hashPassword('Password@123');
+    adminUser = createUser(
+      adminId,
+      adminUsername,
+      adminEmail,
+      hash,
+      salt,
+      adminColor,
+      'https://api.dicebear.com/7.x/bottts/svg?seed=Admin'
+    );
   }
 
   // Seed Users
   const aliceId = 'user-alice-lead';
   const bobId = 'user-bob-dev';
 
-  if (!getUserById(aliceId)) {
-    createUser(aliceId, 'Alice (Quantum Lead)', 'https://api.dicebear.com/7.x/bottts/svg?seed=Alice');
+  if (!getUserById(aliceId) && !getUserByEmail('alice@devcollab.io')) {
+    const { salt, hash } = hashPassword('Password@123');
+    createUser(
+      aliceId,
+      'Alice (Quantum Lead)',
+      'alice@devcollab.io',
+      hash,
+      salt,
+      '#FFB800',
+      'https://api.dicebear.com/7.x/bottts/svg?seed=Alice'
+    );
   }
-  if (!getUserById(bobId)) {
-    createUser(bobId, 'Bob (Crypto Dev)', 'https://api.dicebear.com/7.x/bottts/svg?seed=Bob');
+  if (!getUserById(bobId) && !getUserByEmail('bob@devcollab.io')) {
+    const { salt, hash } = hashPassword('Password@123');
+    createUser(
+      bobId,
+      'Bob (Crypto Dev)',
+      'bob@devcollab.io',
+      hash,
+      salt,
+      '#00F0FF',
+      'https://api.dicebear.com/7.x/bottts/svg?seed=Bob'
+    );
+  }
+
+  const demoProjectId = 'demo-quantum-router';
+  const existingProject = getProjectById(demoProjectId);
+  if (existingProject) {
+    // Ensure admin user is attached as OWNER member of the demo project
+    const adminMember = getProjectMember(demoProjectId, adminId);
+    if (!adminMember) {
+      addProjectMember(uuidv4(), demoProjectId, adminId, 'OWNER');
+    }
+    return;
   }
 
   // Seed Demo Project
@@ -720,11 +862,12 @@ function seedDatabase() {
     'Quantum Router Engine',
     'Distributed packet routing simulation using quantum graph state optimization and CRDT synchronization.',
     'QUANTUM2025',
-    aliceId
+    adminId
   );
 
   // Assign Project Members
-  addProjectMember(uuidv4(), demoProjectId, aliceId, 'OWNER');
+  addProjectMember(uuidv4(), demoProjectId, adminId, 'OWNER');
+  addProjectMember(uuidv4(), demoProjectId, aliceId, 'EDITOR');
   addProjectMember(uuidv4(), demoProjectId, bobId, 'EDITOR');
 
   // Seed Starter File 1: main.py

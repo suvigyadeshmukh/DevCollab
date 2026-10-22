@@ -3,13 +3,16 @@ export type CollaboratorRole = 'OWNER' | 'EDITOR' | 'VIEWER';
 export interface User {
   id: string;
   username: string;
+  email?: string;
+  avatar_color?: string;
   avatar_url?: string;
-  created_at: string;
+  created_at?: string;
 }
 
 export interface UserTokenPayload {
   userId: string;
   username: string;
+  email?: string;
   iat?: number;
   exp?: number;
 }
@@ -103,6 +106,12 @@ export interface CursorPosition {
   avatarUrl?: string;
   lineNumber: number;
   column: number;
+  selection?: {
+    startLineNumber: number;
+    startColumn: number;
+    endLineNumber: number;
+    endColumn: number;
+  };
   color: string;
   fileId: string;
   timestamp: number;

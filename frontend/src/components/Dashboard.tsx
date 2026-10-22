@@ -8,39 +8,35 @@ import {
   ArrowRight,
   Copy,
   Check,
-  UserCheck,
-  ChevronDown,
   Terminal,
   Activity,
   Layers,
   Sparkles,
   AlertTriangle,
-  FolderOpen
+  FolderOpen,
+  LogOut
 } from 'lucide-react';
 import {
-  CollaboratorRole,
-  Persona,
-  Project
+  Project,
+  User
 } from '../types';
 import {
-  DEFAULT_PERSONAS,
   createProject,
   fetchProjects,
   joinProject,
-  switchPersona,
   cn
 } from '../services/api';
 
 interface DashboardProps {
   onSelectProject: (project: Project) => void;
-  currentPersona: Persona;
-  onPersonaChange: (persona: Persona) => void;
+  currentUser: User;
+  onLogout: () => void;
 }
 
 export const Dashboard: React.FC<DashboardProps> = ({
   onSelectProject,
-  currentPersona,
-  onPersonaChange
+  currentUser,
+  onLogout
 }) => {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
@@ -48,11 +44,6 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
   // Invite code copy state
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
-
-  // Persona switcher popover state
-  const [personaOpen, setPersonaOpen] = useState(false);
-  const [customUsername, setCustomUsername] = useState('');
-  const [customRole, setCustomRole] = useState<CollaboratorRole>('EDITOR');
 
   // Create Project Modal state
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -66,7 +57,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
   const [joining, setJoining] = useState(false);
   const [joinFeedback, setJoinFeedback] = useState<{ type: 'success' | 'error'; msg: string } | null>(null);
 
-  // Load projects on persona change or mount
+  // Load private workspace projects for authenticated user
   const loadProjects = async () => {
     try {
       setLoading(true);
@@ -82,35 +73,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
   useEffect(() => {
     loadProjects();
-  }, [currentPersona]);
-
-  // Handle switching personas
-  const handleSwitchPersona = async (persona: Persona) => {
-    try {
-      await switchPersona(persona);
-      onPersonaChange(persona);
-      setPersonaOpen(false);
-    } catch (err: any) {
-      console.error('Failed to switch persona:', err);
-    }
-  };
-
-  const handleCreateCustomPersona = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!customUsername.trim()) return;
-
-    const newPersona: Persona = {
-      id: `user-${Date.now()}`,
-      username: customUsername.trim(),
-      role: customRole,
-      avatarUrl: `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(customUsername.trim())}`,
-      badgeColor: customRole === 'OWNER' ? '#FFB800' : customRole === 'EDITOR' ? '#00F0FF' : '#A855F7',
-      description: `Custom ${customRole} session for multi-tab testing`
-    };
-
-    await handleSwitchPersona(newPersona);
-    setCustomUsername('');
-  };
+  }, [currentUser.id]);
 
   // Copy invite code with feedback
   const handleCopyInvite = (code: string, e: React.MouseEvent) => {
@@ -189,118 +152,35 @@ export const Dashboard: React.FC<DashboardProps> = ({
           </div>
         </div>
 
-        {/* Persona Switcher Menu */}
-        <div className="relative">
-          <button
-            onClick={() => setPersonaOpen(!personaOpen)}
-            className="flex items-center space-x-3 px-3 py-1.5 rounded-lg border border-obsidian-700 bg-obsidian-850 hover:bg-obsidian-800 transition-all shadow-sm"
-          >
-            <img
-              src={currentPersona.avatarUrl}
-              alt={currentPersona.username}
-              className="w-7 h-7 rounded-full border border-obsidian-600 bg-obsidian-900"
-            />
+        {/* Logged-In User Profile & Logout */}
+        <div className="flex items-center space-x-3">
+          <div className="flex items-center space-x-2.5 px-3 py-1.5 rounded-lg border border-obsidian-700 bg-obsidian-850">
+            <div
+              className="w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs text-obsidian-950 shadow-sm ring-1 ring-white/10"
+              style={{ backgroundColor: currentUser.avatar_color || '#00F0FF' }}
+            >
+              {currentUser.username.charAt(0).toUpperCase()}
+            </div>
             <div className="text-left">
-              <div className="text-xs font-semibold text-white flex items-center space-x-1.5">
-                <span>{currentPersona.username}</span>
-                <span
-                  className="text-[9px] px-1.5 py-0.2 rounded font-mono font-bold uppercase tracking-wider"
-                  style={{
-                    backgroundColor: `${currentPersona.badgeColor}20`,
-                    color: currentPersona.badgeColor,
-                    borderColor: `${currentPersona.badgeColor}40`,
-                    borderWidth: '1px'
-                  }}
-                >
-                  {currentPersona.role}
-                </span>
+              <div className="text-xs font-semibold text-white leading-tight">
+                {currentUser.username}
               </div>
-              <p className="text-[10px] text-obsidian-400 font-mono">Click to switch persona</p>
+              {currentUser.email && (
+                <span className="text-[10px] text-obsidian-400 font-mono block">
+                  {currentUser.email}
+                </span>
+              )}
             </div>
-            <ChevronDown className="h-4 w-4 text-obsidian-400" />
+          </div>
+
+          <button
+            onClick={onLogout}
+            title="Sign out of DevCollab session"
+            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border border-obsidian-700 bg-obsidian-850 hover:bg-rose-950/40 hover:border-rose-500/50 hover:text-rose-300 text-obsidian-300 transition-all text-xs font-semibold group shadow-sm"
+          >
+            <Lock className="h-3.5 w-3.5 text-obsidian-400 group-hover:text-rose-400" />
+            <span>Logout</span>
           </button>
-
-          {/* Persona Dropdown Popover */}
-          {personaOpen && (
-            <div className="absolute right-0 mt-2 w-80 glass-panel-elevated rounded-xl p-3 z-50 animate-fade-in border border-obsidian-600 shadow-2xl">
-              <div className="flex items-center justify-between pb-2 mb-2 border-b border-obsidian-700 text-xs font-semibold text-obsidian-300">
-                <span className="flex items-center space-x-1.5">
-                  <UserCheck className="h-4 w-4 text-neon-cyan" />
-                  <span>Instant Multi-Tab Persona Switcher</span>
-                </span>
-              </div>
-
-              <div className="space-y-1.5">
-                {DEFAULT_PERSONAS.map((p) => {
-                  const isCurrent = p.username === currentPersona.username;
-                  return (
-                    <button
-                      key={p.id}
-                      onClick={() => handleSwitchPersona(p)}
-                      className={cn(
-                        "w-full text-left p-2.5 rounded-lg border transition-all flex items-start space-x-2.5",
-                        isCurrent
-                          ? "bg-obsidian-800 border-neon-cyan/50 shadow-sm"
-                          : "bg-obsidian-900/60 border-obsidian-800 hover:bg-obsidian-850 hover:border-obsidian-700"
-                      )}
-                    >
-                      <img
-                        src={p.avatarUrl}
-                        alt={p.username}
-                        className="w-8 h-8 rounded-full border border-obsidian-600 bg-obsidian-950 mt-0.5"
-                      />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-semibold text-white truncate">{p.username}</span>
-                          <span
-                            className="text-[9px] px-1.5 py-0.2 rounded font-mono font-bold"
-                            style={{
-                              backgroundColor: `${p.badgeColor}25`,
-                              color: p.badgeColor
-                            }}
-                          >
-                            {p.role}
-                          </span>
-                        </div>
-                        <p className="text-[11px] text-obsidian-400 line-clamp-1 mt-0.5">{p.description}</p>
-                      </div>
-                      {isCurrent && <Check className="h-4 w-4 text-neon-cyan shrink-0 mt-1" />}
-                    </button>
-                  );
-                })}
-              </div>
-
-              {/* Custom Quick Switch Form */}
-              <form onSubmit={handleCreateCustomPersona} className="mt-3 pt-3 border-t border-obsidian-700/80">
-                <p className="text-[11px] text-obsidian-400 font-mono mb-2">Create Custom Multi-Tab User:</p>
-                <div className="flex space-x-2 mb-2">
-                  <input
-                    type="text"
-                    value={customUsername}
-                    onChange={(e) => setCustomUsername(e.target.value)}
-                    placeholder="E.g. Dave (PenTester)"
-                    className="flex-1 bg-obsidian-950 border border-obsidian-700 rounded px-2.5 py-1 text-xs text-white focus:outline-none focus:border-neon-cyan"
-                  />
-                  <select
-                    value={customRole}
-                    onChange={(e) => setCustomRole(e.target.value as CollaboratorRole)}
-                    className="bg-obsidian-950 border border-obsidian-700 rounded px-2 py-1 text-xs text-obsidian-200 focus:outline-none focus:border-neon-cyan"
-                  >
-                    <option value="OWNER">OWNER</option>
-                    <option value="EDITOR">EDITOR</option>
-                    <option value="VIEWER">VIEWER</option>
-                  </select>
-                </div>
-                <button
-                  type="submit"
-                  disabled={!customUsername.trim()}
-                  className="w-full py-1 text-xs rounded bg-obsidian-800 hover:bg-obsidian-700 text-neon-cyan border border-neon-cyan/30 disabled:opacity-50 transition"
-                >
-                  Switch into Persona
-                </button>
-              </form>
-            </div>
-          )}
         </div>
       </header>
 

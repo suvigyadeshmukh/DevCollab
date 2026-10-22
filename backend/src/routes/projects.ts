@@ -22,44 +22,13 @@ export const projectsRouter = Router();
 
 /**
  * POST /session
- * Creates or retrieves user and returns signed JWT
+ * DEPRECATED: Insecure persona switcher endpoint removed for zero-trust email & password auth.
  */
-projectsRouter.post('/session', (req: AuthenticatedRequest, res: Response): void => {
-  try {
-    const rawUsername = req.body.username;
-    const rawAvatarUrl = req.body.avatarUrl || req.body.avatar_url;
-
-    let username = typeof rawUsername === 'string' ? sanitizeText(rawUsername.trim(), 50) : '';
-    if (!username) {
-      username = `Engineer_${Math.floor(1000 + Math.random() * 9000)}`;
-    }
-
-    let user = getUserByUsername(username);
-    if (!user) {
-      const newUserId = uuidv4();
-      const avatarUrl = typeof rawAvatarUrl === 'string'
-        ? sanitizeText(rawAvatarUrl.trim(), 255)
-        : `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(username)}`;
-      user = createUser(newUserId, username, avatarUrl);
-    }
-
-    const token = signToken({
-      userId: user.id,
-      username: user.username
-    });
-
-    res.status(200).json({
-      token,
-      user: {
-        id: user.id,
-        username: user.username,
-        avatar_url: user.avatar_url,
-        created_at: user.created_at
-      }
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: 'Failed to establish session', details: error.message });
-  }
+projectsRouter.post('/session', (_req: AuthenticatedRequest, res: Response): void => {
+  res.status(410).json({
+    error: 'Endpoint Deprecated',
+    message: 'The insecure persona session endpoint has been removed. Please authenticate via /api/auth/login or /api/auth/register.'
+  });
 });
 
 /**
